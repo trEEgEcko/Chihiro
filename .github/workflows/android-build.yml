@@ -66,6 +66,31 @@ jobs:
               float vw = std::min(w, h * aspect);""")
           print("aspect patch applied")
           PYEOF
+      - name: Add F9 aspect hotkey
+        run: |
+          python3 - <<'PYEOF'
+          import sys
+          f = "sdk/runtime/app/window_sdl.cpp"
+          s = open(f).read()
+          if "SDL_SCANCODE_F9" in s:
+              print("F9 hotkey already present"); sys.exit(0)
+          old = "    if (k.scancode == SDL_SCANCODE_F10) {\n        if (k.down && !k.repeat) ToggleGraphicsMenu();"
+          new = "    if (k.scancode == SDL_SCANCODE_F9) {\n        if (k.down && !k.repeat) { Settings& st = Get(); st.aspect = (st.aspect + 1) % 4; Save(); }\n        return;\n    }\n" + old
+          if old not in s: sys.exit("F9 anchor not found")
+          open(f, "w").write(s.replace(old, new, 1))
+          print("F9 aspect hotkey added")
+          PYEOF
+      - name: Apply HOTD3 HUD patch (icon, buttons, layout)
+        if: ${{ inputs.port == 'HOTD3' }}
+        working-directory: .
+        run: |
+          if [ -f .github/workflows/hotd3_patch.zip ]; then
+            unzip -o .github/workflows/hotd3_patch.zip -d .
+            rm -f ports/HOTD3/android/app/src/main/res/drawable/ic_launcher.xml
+            echo "HUD patch applied"
+          else
+            echo "::warning::hotd3_patch.zip not found in .github/workflows - building without HUD patch"
+          fi
       - name: Fetch game archive
         run: |
           test -n "$ARCHIVE_URL" || { echo "Set repo secret GAME_ARCHIVE_URL"; exit 1; }

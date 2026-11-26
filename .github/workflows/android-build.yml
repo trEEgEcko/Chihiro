@@ -50,10 +50,10 @@ jobs:
           r = "sdk/runtime/"
           if "aspect_ratio" in open(r + "app/settings.cpp").read():
               print("aspect patch already present"); sys.exit(0)
-          edit(r+"app/app.h", "    uint32_t aniso = 0; ", "    uint32_t aspect = 0;             // 0 auto, 1 4:3, 2 16:9, 3 stretch to screen\n    uint32_t aniso = 0; ")
+          edit(r+"app/app.h", "    uint32_t aniso = 0; ", "    uint32_t aspect = 0;             // 0 auto, 1 4:3, 2 16:9, 3 stretch, 4 fill (zoom)\n    uint32_t aniso = 0; ")
           edit(r+"app/settings.cpp", '    s.aniso = t["anisotropic_filtering"].value_or(s.aniso);', '    s.aniso = t["anisotropic_filtering"].value_or(s.aniso);\n    s.aspect = t["aspect_ratio"].value_or(s.aspect);')
           edit(r+"app/settings.cpp", '                  {"anisotropic_filtering", int64_t(s.aniso)},', '                  {"anisotropic_filtering", int64_t(s.aniso)},\n                  {"aspect_ratio", int64_t(s.aspect)},')
-          edit(r+"app/graphics_menu.cpp", "        const uint32_t filters[] = {0,2,4,8,16};", '        const uint32_t aspects[] = {0,1,2,3};\n        const char* const aspect_names[] = {"Auto", "4:3", "16:9", "Stretch (fill screen)"};\n        Choice("Aspect ratio",draft.aspect,aspects,aspect_names);\n        const uint32_t filters[] = {0,2,4,8,16};')
+          edit(r+"app/graphics_menu.cpp", "        const uint32_t filters[] = {0,2,4,8,16};", '        const uint32_t aspects[] = {0,1,2,3,4};\n        const char* const aspect_names[] = {"Auto", "4:3", "16:9", "Stretch (fill screen)", "Fill (zoom, no stretch)"};\n        Choice("Aspect ratio",draft.aspect,aspects,aspect_names);\n        const uint32_t filters[] = {0,2,4,8,16};')
           edit(r+"app/graphics_menu.cpp", "s.render_percent=draft.render_percent; s.aniso=draft.aniso;", "s.render_percent=draft.render_percent; s.aniso=draft.aniso; s.aspect=draft.aspect;")
           edit(r+"gpu/vulkan_present.cpp", """    float aspect = app::Widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f;
               float w = float(bb.desc.w);
@@ -69,10 +69,12 @@ jobs:
                                          : std::max(w, h) / std::min(w, h);
               const auto xf = swap_ ? swap_->Transform() : VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
               const bool turned = xf == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR || xf == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR;
-              const uint32_t am = app::Get().aspect;  // 0 auto, 1 4:3, 2 16:9, 3 stretch
+              const uint32_t am = app::Get().aspect;  // 0 auto, 1 4:3, 2 16:9, 3 stretch, 4 fill (zoom)
               float aspect = am == 1 ? 4.0f / 3.0f : am == 2 ? 16.0f / 9.0f : am == 3 ? S
                            : (app::Widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f);
-              const float fx = std::min(1.0f, aspect / S), fy = std::min(1.0f, S / aspect);
+              const bool cover = am == 4;  // scale uniformly until the screen is covered; the overflow is cropped
+              const float fx = cover ? std::max(1.0f, aspect / S) : std::min(1.0f, aspect / S);
+              const float fy = cover ? std::max(1.0f, S / aspect) : std::min(1.0f, S / aspect);
               float vw = (turned ? fy : fx) * w;
               float vh = (turned ? fx : fy) * h;""")
           print("aspect patch applied")
@@ -86,10 +88,12 @@ jobs:
           if "SDL_SCANCODE_F9" in s:
               print("F9 hotkey already present"); sys.exit(0)
           old = "    if (k.scancode == SDL_SCANCODE_F10) {\n        if (k.down && !k.repeat) ToggleGraphicsMenu();"
-          new = "    if (k.scancode == SDL_SCANCODE_F9) {\n        if (k.down && !k.repeat) { Settings& st = Get(); st.aspect = (st.aspect + 1) % 4; Save(); }\n        return;\n    }\n" + old
+          new = ("    if (k.scancode == SDL_SCANCODE_F6) { SetTestSwitch(k.down); return; }\n"
+                 "    if (k.scancode == SDL_SCANCODE_F7) { SetServiceSwitch(k.down); return; }\n"
+                 "    if (k.scancode == SDL_SCANCODE_F9) {\n        if (k.down && !k.repeat) { Settings& st = Get(); st.aspect = (st.aspect + 1) % 5; Save(); }\n        return;\n    }\n") + old
           if old not in s: sys.exit("F9 anchor not found")
           open(f, "w").write(s.replace(old, new, 1))
-          print("F9 aspect hotkey added")
+          print("F9 aspect hotkey and F6/F7 test/service keys added")
           PYEOF
       - name: Fix touch aim for aspect modes
         run: |
@@ -102,26 +106,42 @@ jobs:
               open(f, "w").write(t.replace(old, new, 1)); return True
           if "PresentAspect" in open("sdk/runtime/app/app.h").read():
               print("aim fix already present"); sys.exit(0)
-          edit("sdk/runtime/app/app.h", "bool Widescreen();", "bool Widescreen();\nfloat PresentAspect(float w, float h);  // the aspect the frame is presented at (Aspect ratio setting)")
-          edit("sdk/runtime/app/settings.cpp", "float RenderScale(uint32_t guest_height) {",
-          """float PresentAspect(float w, float h) {
+          edit("sdk/runtime/app/app.h", "bool Widescreen();", """bool Widescreen();
+          float PresentAspect(float w, float h);  // aspect the frame is presented at; negative means fill (zoom)
+          bool TestSwitch();
+          bool ServiceSwitch();
+          void SetTestSwitch(bool down);
+          void SetServiceSwitch(bool down);""")
+          t = open("sdk/runtime/app/settings.cpp").read()
+          t = t.replace("#include", "#include <atomic>\n#include", 1)
+          t = t.replace("float RenderScale(uint32_t guest_height) {", """float PresentAspect(float w, float h) {
               const uint32_t am = Get().aspect;
               if (am == 1) return 4.0f / 3.0f;
               if (am == 2) return 16.0f / 9.0f;
               if (am == 3 && w > 0 && h > 0) return w / h;
+              if (am == 4) return -(Widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f);
               return Widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f;
           }
 
-          float RenderScale(uint32_t guest_height) {""")
+          namespace { std::atomic<bool> g_test_switch{false}, g_service_switch{false}; }
+          bool TestSwitch() { return g_test_switch.load(); }
+          bool ServiceSwitch() { return g_service_switch.load(); }
+          void SetTestSwitch(bool down) { g_test_switch.store(down); }
+          void SetServiceSwitch(bool down) { g_service_switch.store(down); }
+
+          float RenderScale(uint32_t guest_height) {""", 1)
+          open("sdk/runtime/app/settings.cpp", "w").write(t)
           mh = "src/game/mouse.h"
           if os.path.exists(mh):
               t = open(mh).read()
               old1 = "inline Aim MapMouse(float x, float y, float width, float height, bool wide) {"
               old2 = "    const float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;\n"
+              old3 = "    const float w = std::min(width, height * aspect), h = w / aspect;\n"
               end = "            u >= 0 && u < 1 && v >= 0 && v < 1};\n}\n"
-              if old1 in t and old2 in t and end in t:
+              if old1 in t and old2 in t and old3 in t and end in t:
                   t = t.replace(old1, "inline Aim MapMouseAspect(float x, float y, float width, float height, float aspect) {", 1)
                   t = t.replace(old2, "", 1)
+                  t = t.replace(old3, "    const bool cover = aspect < 0;  // fill (zoom): the picture overflows the screen\n    const float a = std::fabs(aspect);\n    const float w = cover ? std::max(width, height * a) : std::min(width, height * a), h = w / a;\n", 1)
                   t = t.replace(end, end + "\ninline Aim MapMouse(float x, float y, float width, float height, bool wide) {\n    return MapMouseAspect(x, y, width, height, wide ? 16.0f / 9.0f : 4.0f / 3.0f);\n}\n", 1)
                   open(mh, "w").write(t)
                   old = "MapMouse(mouse.x, mouse.y, mouse.width, mouse.height, app::Widescreen())"
@@ -135,6 +155,28 @@ jobs:
               else:
                   print("::warning::mouse.h layout differs, touch aim not updated")
           print("aim fix applied")
+          PYEOF
+      - name: Wire test/service switches
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          cab = "src/game/cabinet.cpp"
+          if not os.path.exists(cab):
+              print("no cabinet.cpp"); raise SystemExit
+          t = open(cab).read()
+          if "app::TestSwitch" in t:
+              print("test/service already present"); raise SystemExit
+          n = 0
+          for old, new in [
+              ("    Byte(reports, 0);\n", "    Byte(reports, enabled && app::TestSwitch() ? 0x80 : 0);\n"),
+              ("    Byte(reports, 0); // System/test switch.\n", "    Byte(reports, enabled && app::TestSwitch() ? 0x80 : 0); // System/test switch.\n"),
+              ("(pad.analog[0] ? 2 : 0) | (pad.analog[1] ? 1 : 0)) : 0);", "(pad.analog[0] ? 2 : 0) | (pad.analog[1] ? 1 : 0) | (app::ServiceSwitch() ? 0x40 : 0)) : 0);"),
+              ("         (pad.analog[0] ? 2 : 0)) : 0);", "         (pad.analog[0] ? 2 : 0) | (app::ServiceSwitch() ? 0x40 : 0)) : 0);"),
+          ]:
+              if old in t:
+                  t = t.replace(old, new, 1); n += 1
+          open(cab, "w").write(t)
+          print("test/service switches wired (%d edits)" % n)
           PYEOF
       - name: Apply HUD patch (icon, buttons, layout)
         working-directory: .

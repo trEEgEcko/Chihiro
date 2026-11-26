@@ -211,10 +211,9 @@ void VulkanRenderer::UploadGammaRamp() {
 // the frame letterboxed into the open target: 16:9 when the console reports a widescreen display, else 4:3
 void VulkanRenderer::BlitFrame(Target& t, Image& bb) {
     if (SkipPart("noblit")) return;
+    float aspect = app::Widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f;
     float w = float(bb.desc.w);
     float h = float(bb.desc.h);
-    // Keep 16:9 / 4:3 aspect un-stretched for accurate logos/circles, or set aspect = (h > 0.0f) ? (w / h) : (4.0f / 3.0f) for full 20:9 fill.
-    float aspect = (h > 0.0f) ? (w / h) : (app::Widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f);
     float vw = std::min(w, h * aspect);
     float vh = vw / aspect;
     SetViewport((w - vw) / 2, (h - vh) / 2, vw, vh);

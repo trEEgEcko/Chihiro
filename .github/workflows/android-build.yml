@@ -125,16 +125,18 @@ jobs:
                   print("::warning::mouse.h layout differs, touch aim not updated")
           print("aim fix applied")
           PYEOF
-      - name: Apply HOTD3 HUD patch (icon, buttons, layout)
-        if: ${{ inputs.port == 'HOTD3' }}
+      - name: Apply HUD patch (icon, buttons, layout)
         working-directory: .
+        env:
+          PORT: ${{ inputs.port }}
         run: |
-          if [ -f .github/workflows/hotd3_patch.zip ]; then
-            unzip -o .github/workflows/hotd3_patch.zip -d .
-            rm -f ports/HOTD3/android/app/src/main/res/drawable/ic_launcher.xml
-            echo "HUD patch applied"
+          ZIP=".github/workflows/$(echo "$PORT" | tr 'A-Z' 'a-z')_patch.zip"
+          if [ -f "$ZIP" ]; then
+            unzip -o "$ZIP" -d .
+            rm -f "ports/$PORT/android/app/src/main/res/drawable/ic_launcher.xml"
+            echo "HUD patch applied: $ZIP"
           else
-            echo "::warning::hotd3_patch.zip not found in .github/workflows - building without HUD patch"
+            echo "::warning::$ZIP not found - building without HUD patch"
           fi
       - name: Fetch game archive
         run: |

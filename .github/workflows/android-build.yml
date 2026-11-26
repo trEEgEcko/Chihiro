@@ -50,7 +50,7 @@ jobs:
           r = "sdk/runtime/"
           if "aspect_ratio" in open(r + "app/settings.cpp").read():
               print("aspect patch already present"); sys.exit(0)
-          edit(r+"app/app.h", "    uint32_t aniso = 0; ", "    uint32_t aspect = 0;             // 0 auto, 1 4:3, 2 16:9, 3 stretch\n    uint32_t aniso = 0; ")
+          edit(r+"app/app.h", "    uint32_t aniso = 0; ", "    uint32_t aspect = 0;             // 0 auto, 1 4:3, 2 16:9, 3 stretch to screen\n    uint32_t aniso = 0; ")
           edit(r+"app/settings.cpp", '    s.aniso = t["anisotropic_filtering"].value_or(s.aniso);', '    s.aniso = t["anisotropic_filtering"].value_or(s.aniso);\n    s.aspect = t["aspect_ratio"].value_or(s.aspect);')
           edit(r+"app/settings.cpp", '                  {"anisotropic_filtering", int64_t(s.aniso)},', '                  {"anisotropic_filtering", int64_t(s.aniso)},\n                  {"aspect_ratio", int64_t(s.aspect)},')
           edit(r+"app/graphics_menu.cpp", "        const uint32_t filters[] = {0,2,4,8,16};", '        const uint32_t aspects[] = {0,1,2,3};\n        const char* const aspect_names[] = {"Auto", "4:3", "16:9", "Stretch (fill screen)"};\n        Choice("Aspect ratio",draft.aspect,aspects,aspect_names);\n        const uint32_t filters[] = {0,2,4,8,16};')
@@ -58,12 +58,23 @@ jobs:
           edit(r+"gpu/vulkan_present.cpp", """    float aspect = app::Widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f;
               float w = float(bb.desc.w);
               float h = float(bb.desc.h);
-              float vw = std::min(w, h * aspect);""", """    float w = float(bb.desc.w);
+              float vw = std::min(w, h * aspect);
+              float vh = vw / aspect;""", """    float w = float(bb.desc.w);
               float h = float(bb.desc.h);
-              const uint32_t am = app::Get().aspect;
-              float aspect = am == 1 ? 4.0f / 3.0f : am == 2 ? 16.0f / 9.0f : am == 3 ? w / h
+              // The display is landscape. A surface pre-rotated by 90/270 degrees is turned by the compositor, so the
+              // letterbox is worked out in display terms and then transposed into the buffer.
+              uint32_t ww = 0, wh = 0;
+              app::WindowPixels(ww, wh);
+              const float S = (ww && wh) ? float(std::max(ww, wh)) / float(std::min(ww, wh))
+                                         : std::max(w, h) / std::min(w, h);
+              const auto xf = swap_ ? swap_->Transform() : VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+              const bool turned = xf == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR || xf == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR;
+              const uint32_t am = app::Get().aspect;  // 0 auto, 1 4:3, 2 16:9, 3 stretch
+              float aspect = am == 1 ? 4.0f / 3.0f : am == 2 ? 16.0f / 9.0f : am == 3 ? S
                            : (app::Widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f);
-              float vw = std::min(w, h * aspect);""")
+              const float fx = std::min(1.0f, aspect / S), fy = std::min(1.0f, S / aspect);
+              float vw = (turned ? fy : fx) * w;
+              float vh = (turned ? fx : fy) * h;""")
           print("aspect patch applied")
           PYEOF
       - name: Add F9 aspect hotkey

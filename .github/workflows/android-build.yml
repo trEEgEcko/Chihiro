@@ -38,6 +38,34 @@ jobs:
           "$ANDROID_SDK_ROOT"/cmdline-tools/latest/bin/sdkmanager "platforms;android-35" "build-tools;36.0.0" "ndk;28.2.13676358"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "NDK=$ANDROID_SDK_ROOT/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - name: Apply aspect ratio patch
+        run: |
+          python3 - <<'PYEOF'
+          import sys
+          def edit(f, old, new):
+              s = open(f).read()
+              if old not in s:
+                  sys.exit("patch anchor not found in " + f)
+              open(f, "w").write(s.replace(old, new, 1))
+          r = "sdk/runtime/"
+          if "aspect_ratio" in open(r + "app/settings.cpp").read():
+              print("aspect patch already present"); sys.exit(0)
+          edit(r+"app/app.h", "    uint32_t aniso = 0; ", "    uint32_t aspect = 0;             // 0 auto, 1 4:3, 2 16:9, 3 stretch\n    uint32_t aniso = 0; ")
+          edit(r+"app/settings.cpp", '    s.aniso = t["anisotropic_filtering"].value_or(s.aniso);', '    s.aniso = t["anisotropic_filtering"].value_or(s.aniso);\n    s.aspect = t["aspect_ratio"].value_or(s.aspect);')
+          edit(r+"app/settings.cpp", '                  {"anisotropic_filtering", int64_t(s.aniso)},', '                  {"anisotropic_filtering", int64_t(s.aniso)},\n                  {"aspect_ratio", int64_t(s.aspect)},')
+          edit(r+"app/graphics_menu.cpp", "        const uint32_t filters[] = {0,2,4,8,16};", '        const uint32_t aspects[] = {0,1,2,3};\n        const char* const aspect_names[] = {"Auto", "4:3", "16:9", "Stretch (fill screen)"};\n        Choice("Aspect ratio",draft.aspect,aspects,aspect_names);\n        const uint32_t filters[] = {0,2,4,8,16};')
+          edit(r+"app/graphics_menu.cpp", "s.render_percent=draft.render_percent; s.aniso=draft.aniso;", "s.render_percent=draft.render_percent; s.aniso=draft.aniso; s.aspect=draft.aspect;")
+          edit(r+"gpu/vulkan_present.cpp", """    float aspect = app::Widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f;
+              float w = float(bb.desc.w);
+              float h = float(bb.desc.h);
+              float vw = std::min(w, h * aspect);""", """    float w = float(bb.desc.w);
+              float h = float(bb.desc.h);
+              const uint32_t am = app::Get().aspect;
+              float aspect = am == 1 ? 4.0f / 3.0f : am == 2 ? 16.0f / 9.0f : am == 3 ? w / h
+                           : (app::Widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f);
+              float vw = std::min(w, h * aspect);""")
+          print("aspect patch applied")
+          PYEOF
       - name: Fetch game archive
         run: |
           test -n "$ARCHIVE_URL" || { echo "Set repo secret GAME_ARCHIVE_URL"; exit 1; }

@@ -80,6 +80,51 @@ jobs:
           open(f, "w").write(s.replace(old, new, 1))
           print("F9 aspect hotkey added")
           PYEOF
+      - name: Fix touch aim for aspect modes
+        run: |
+          python3 - <<'PYEOF'
+          import os, sys
+          def edit(f, old, new):
+              t = open(f).read()
+              if old not in t:
+                  print("::warning::anchor not found in " + f); return False
+              open(f, "w").write(t.replace(old, new, 1)); return True
+          if "PresentAspect" in open("sdk/runtime/app/app.h").read():
+              print("aim fix already present"); sys.exit(0)
+          edit("sdk/runtime/app/app.h", "bool Widescreen();", "bool Widescreen();\nfloat PresentAspect(float w, float h);  // the aspect the frame is presented at (Aspect ratio setting)")
+          edit("sdk/runtime/app/settings.cpp", "float RenderScale(uint32_t guest_height) {",
+          """float PresentAspect(float w, float h) {
+              const uint32_t am = Get().aspect;
+              if (am == 1) return 4.0f / 3.0f;
+              if (am == 2) return 16.0f / 9.0f;
+              if (am == 3 && w > 0 && h > 0) return w / h;
+              return Widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f;
+          }
+
+          float RenderScale(uint32_t guest_height) {""")
+          mh = "src/game/mouse.h"
+          if os.path.exists(mh):
+              t = open(mh).read()
+              old1 = "inline Aim MapMouse(float x, float y, float width, float height, bool wide) {"
+              old2 = "    const float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;\n"
+              end = "            u >= 0 && u < 1 && v >= 0 && v < 1};\n}\n"
+              if old1 in t and old2 in t and end in t:
+                  t = t.replace(old1, "inline Aim MapMouseAspect(float x, float y, float width, float height, float aspect) {", 1)
+                  t = t.replace(old2, "", 1)
+                  t = t.replace(end, end + "\ninline Aim MapMouse(float x, float y, float width, float height, bool wide) {\n    return MapMouseAspect(x, y, width, height, wide ? 16.0f / 9.0f : 4.0f / 3.0f);\n}\n", 1)
+                  open(mh, "w").write(t)
+                  old = "MapMouse(mouse.x, mouse.y, mouse.width, mouse.height, app::Widescreen())"
+                  new = "MapMouseAspect(mouse.x, mouse.y, mouse.width, mouse.height, app::PresentAspect(mouse.width, mouse.height))"
+                  for fn in os.listdir("src/game"):
+                      fp = os.path.join("src/game", fn)
+                      if fn.endswith((".cpp", ".h")):
+                          c = open(fp).read()
+                          if old in c:
+                              open(fp, "w").write(c.replace(old, new)); print("aim mapping updated in " + fp)
+              else:
+                  print("::warning::mouse.h layout differs, touch aim not updated")
+          print("aim fix applied")
+          PYEOF
       - name: Apply HOTD3 HUD patch (icon, buttons, layout)
         if: ${{ inputs.port == 'HOTD3' }}
         working-directory: .

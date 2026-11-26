@@ -44,7 +44,8 @@ jobs:
           NAME=$(python3 -c "import json;print(json.load(open('config/media.json'))['archive'])")
           if echo "$ARCHIVE_URL" | grep -q "drive.google.com"; then
             pip install gdown
-            gdown --fuzzy "$ARCHIVE_URL" -O "/tmp/$NAME"
+            ID=$(echo "$ARCHIVE_URL" | sed -E 's#.*/d/([^/?]+).*#\1#')
+            gdown "$ID" -O "/tmp/$NAME"
           else
             curl -fL --retry 3 "$ARCHIVE_URL" -o "/tmp/$NAME"
           fi

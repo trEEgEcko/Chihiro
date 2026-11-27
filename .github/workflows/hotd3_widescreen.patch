@@ -1,0 +1,290 @@
+diff --git a/ports/HOTD3/sdk/runtime/app/app.h b/ports/HOTD3/sdk/runtime/app/app.h
+index 261bafb..ead3776 100644
+--- a/ports/HOTD3/sdk/runtime/app/app.h
++++ b/ports/HOTD3/sdk/runtime/app/app.h
+@@ -33,6 +33,7 @@ struct Settings {
+     bool vsync = true;
+ #endif
+     uint32_t aniso = 0;              // 0 as the game asks
++    uint32_t aspect = 0;             // 0 native 4:3, 1 widescreen 16:9, 2 ultrawide 21:9, 3 fit the screen (aspect_ratio in the settings file)
+     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
+ };
+ 
+@@ -50,6 +51,11 @@ Mode Output();
+ float RenderScale(uint32_t guest_height);
+ // the output is 3:2 or wider: the console reports a widescreen TV and the frame is shown 16:9, else 4:3 as on a 4:3 TV
+ bool Widescreen();
++// the aspect the frame is shown at, from Settings::aspect: 4:3, 16:9, 21:9 or the window's own shape
++float PresentAspect();
++// 4:3 divided by PresentAspect(): the factor the frame's x clip coordinates are squeezed by, 1 for native 4:3. The console
++// always renders 4:3; squeezing x by this and showing the frame PresentAspect() wide keeps shapes square and adds view at the sides
++float WideScale();
+ 
+ std::filesystem::path ExeDir();
+ // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc
+diff --git a/ports/HOTD3/sdk/runtime/app/graphics_menu.cpp b/ports/HOTD3/sdk/runtime/app/graphics_menu.cpp
+index a04a54b..3b9a10e 100644
+--- a/ports/HOTD3/sdk/runtime/app/graphics_menu.cpp
++++ b/ports/HOTD3/sdk/runtime/app/graphics_menu.cpp
+@@ -92,6 +92,9 @@ void DrawGraphicsMenu(double fps) {
+         int scale = int(draft.render_percent);
+         if (ImGui::SliderInt("Render scale", &scale, 25, 300, "%d%%")) draft.render_percent=uint32_t(scale);
+         ImGui::TextWrapped("100%% renders at the selected output height. Higher values supersample; lower values reduce GPU load.");
++        const uint32_t aspects[] = {0,1,2,3};
++        const char* const aspect_names[] = {"Native 4:3", "Widescreen 16:9 (wider view)", "Ultrawide 21:9 (wider view)", "Fit screen (wider view, no bars)"};
++        Choice("Aspect ratio",draft.aspect,aspects,aspect_names);
+         const uint32_t filters[] = {0,2,4,8,16};
+         const char* const filter_names[] = {"Game default", "2x", "4x", "8x", "16x"};
+         Choice("Texture filtering",draft.aniso,filters,filter_names);
+@@ -104,7 +107,7 @@ void DrawGraphicsMenu(double fps) {
+         if (ImGui::Button("Apply and save")) {
+             auto& s = Get();
+             s.display_mode=draft.display_mode; s.width=draft.width; s.height=draft.height;
+-            s.render_percent=draft.render_percent; s.aniso=draft.aniso;
++            s.render_percent=draft.render_percent; s.aniso=draft.aniso; s.aspect=draft.aspect;
+             s.fps_cap=draft.fps_cap; s.vsync=draft.vsync;
+             ApplyDisplay(); Save();
+         }
+diff --git a/ports/HOTD3/sdk/runtime/app/settings.cpp b/ports/HOTD3/sdk/runtime/app/settings.cpp
+index cbcbde2..ad91839 100644
+--- a/ports/HOTD3/sdk/runtime/app/settings.cpp
++++ b/ports/HOTD3/sdk/runtime/app/settings.cpp
+@@ -52,6 +52,8 @@ void Load() {
+     s.fps_cap = t["fps_cap"].value_or(s.fps_cap);
+     s.vsync = t["vsync"].value_or(s.vsync);
+     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
++    s.aspect = t["aspect_ratio"].value_or(s.aspect);
++    if (s.aspect > 3) s.aspect = 0;
+     s.join_ip = t["join_ip"].value_or(s.join_ip);
+     for (const Option& o : kGame.options) {
+         if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
+@@ -73,6 +75,7 @@ toml::table Table() {
+                   {"fps_cap", int64_t(s.fps_cap)},
+                   {"vsync", s.vsync},
+                   {"anisotropic_filtering", int64_t(s.aniso)},
++                  {"aspect_ratio", int64_t(s.aspect)},
+                   {"join_ip", s.join_ip}};
+     for (const Option& o : kGame.options) {
+         if (o.flag) t.insert(o.key, *o.flag);
+@@ -131,6 +134,22 @@ bool Widescreen() {
+     return wide;
+ }
+ 
++float PresentAspect() {
++    switch (Get().aspect) {
++        case 1: return 16.0f / 9.0f;
++        case 2: return 21.0f / 9.0f;
++        case 3: {  // fit the screen: the box is the window's own shape, so nothing is left black
++            uint32_t w = 0, h = 0;
++            WindowPixels(w, h);
++            if (w && h) return float(w > h ? w : h) / float(w > h ? h : w);
++            return 16.0f / 9.0f;
++        }
++        default: return 4.0f / 3.0f;
++    }
++}
++
++float WideScale() { return (4.0f / 3.0f) / PresentAspect(); }
++
+ float RenderScale(uint32_t guest_height) {
+     float h = Output().height * (Get().render_percent / 100.0f);
+     return guest_height ? std::max(h / guest_height, 0.1f) : 1.0f;
+diff --git a/ports/HOTD3/sdk/runtime/app/window_sdl.cpp b/ports/HOTD3/sdk/runtime/app/window_sdl.cpp
+index e189d6e..aa61d52 100644
+--- a/ports/HOTD3/sdk/runtime/app/window_sdl.cpp
++++ b/ports/HOTD3/sdk/runtime/app/window_sdl.cpp
+@@ -91,6 +91,10 @@ void ApplyNow() {
+ 
+ // the scancode's virtual key, as the window would have been sent it
+ void OnKey(const SDL_KeyboardEvent& k) {
++    if (k.scancode == SDL_SCANCODE_F9) {
++        if (k.down && !k.repeat) { Settings& st = Get(); st.aspect = (st.aspect + 1) % 4; Save(); }
++        return;
++    }
+     if (k.scancode == SDL_SCANCODE_F10) {
+         if (k.down && !k.repeat) ToggleGraphicsMenu();
+         return;
+diff --git a/ports/HOTD3/sdk/runtime/gpu/shaders.cpp b/ports/HOTD3/sdk/runtime/gpu/shaders.cpp
+index da10839..0c31494 100644
+--- a/ports/HOTD3/sdk/runtime/gpu/shaders.cpp
++++ b/ports/HOTD3/sdk/runtime/gpu/shaders.cpp
+@@ -56,6 +56,7 @@ const char* kCommonTail = R"(    float4 spread[4];
+     float4x4 blend_wvp[3];
+     float4x4 blend_wv[3];
+     float4x4 blend_wvn[3];
++    float4 wide;
+ };
+ )";
+ 
+@@ -229,6 +230,8 @@ const char* kVsEpilogue = R"(
+     if (surf.w == 0 && abs(p.x - (surf.x - 0.5)) < 1e-3) p.x = surf.x;
+     if (surf.w == 0 && abs(p.y - (surf.y - 0.5)) < 1e-3) p.y = surf.y;
+     q.x = p.x * 2 / surf.x - 1;
++    // widescreen: the console renders 4:3, the frame is shown wider; squeezing x here adds view at the sides
++    q.x *= wide.x > 0 ? wide.x : 1;
+     q.y = 1 - p.y * 2 / surf.y;
+     q.z = p.z * surf.z;
+     q.xyz *= p.w;
+diff --git a/ports/HOTD3/sdk/runtime/gpu/shaders.h b/ports/HOTD3/sdk/runtime/gpu/shaders.h
+index 6746a5f..bd373c4 100644
+--- a/ports/HOTD3/sdk/runtime/gpu/shaders.h
++++ b/ports/HOTD3/sdk/runtime/gpu/shaders.h
+@@ -101,6 +101,7 @@ struct DrawConstants {
+     float blend_wvp[3][16];
+     float blend_wv[3][16];
+     float blend_wvn[3][16];
++    float wide[4];      // x: factor the x clip coordinate is squeezed by (widescreen); 0 or 1 leave it
+ };
+ 
+ }  // namespace gpu
+diff --git a/ports/HOTD3/sdk/runtime/gpu/vulkan.cpp b/ports/HOTD3/sdk/runtime/gpu/vulkan.cpp
+index 48aacc2..cbeb09f 100644
+--- a/ports/HOTD3/sdk/runtime/gpu/vulkan.cpp
++++ b/ports/HOTD3/sdk/runtime/gpu/vulkan.cpp
+@@ -1710,6 +1710,12 @@ void VulkanRenderer::UploadConstants(const State& s, const DrawShaders& sh, cons
+     FillFogConstants(s, sh.prog, c);
+     FillCombinerConstants(s, c);
+     FillTextureConstants(s, stages, c);
++    c.wide[0] = 1.0f;
++    if (bound_rt_ && frame_targets_.count(bound_rt_->data)) {
++        c.wide[0] = app::WideScale();
++        if (c.wide[0] != 1.0f)
++            LOG_FIRST(1, "vulkan: widescreen x scale %.4f on frame target %08X", c.wide[0], bound_rt_->data);
++    }
+     if (sh.fixed_transform) {
+         FillTransformConstants(s, size, c);
+         FillLightConstants(s, sh.fk, c);
+@@ -2088,6 +2094,9 @@ void VulkanRenderer::Copy(const Surface& src, const Surface& dst, uint32_t count
+     Target* dst_t = EnsureTarget(dst, false);
+     // EnsureTarget may have made another target: src_t's entry is unmoved (unordered_map keeps nodes)
+     if (!dst_t || src_t == dst_t) return;
++    // drawn elsewhere and copied into the frame: that is the frame
++    if (frame_targets_.count(dst_t->data) && src_t->gw == dst_t->gw && src_t->gh == dst_t->gh && frame_targets_.size() < 8)
++        frame_targets_.insert(src_t->data);
+     CopyList l{count, src_rects, dst_points};
+     // formats that differ are drawn across
+     if (src_t->fmt != dst_t->fmt) {
+diff --git a/ports/HOTD3/sdk/runtime/gpu/vulkan.h b/ports/HOTD3/sdk/runtime/gpu/vulkan.h
+index 35f1b81..9b9fe0c 100644
+--- a/ports/HOTD3/sdk/runtime/gpu/vulkan.h
++++ b/ports/HOTD3/sdk/runtime/gpu/vulkan.h
+@@ -426,6 +426,9 @@ private:
+     VkFormat ui_format_ = VK_FORMAT_UNDEFINED;  // the format the panel's pipelines were made for; ImGui keeps a
+                                                 // pointer to this, so it must outlive them
+     uint64_t presents_ = 0;
++    // guest addresses of the targets the title presents (and the targets copied into them): draws to these get the
++    // widescreen x squeeze
++    std::unordered_set<uint32_t> frame_targets_;
+     double fps_ = 0;
+     renderer::PerfClock::time_point fps_t_ = renderer::PerfClock::now();
+     uint64_t fps_n_ = 0;
+diff --git a/ports/HOTD3/sdk/runtime/gpu/vulkan_present.cpp b/ports/HOTD3/sdk/runtime/gpu/vulkan_present.cpp
+index 0eaa70a..b048746 100644
+--- a/ports/HOTD3/sdk/runtime/gpu/vulkan_present.cpp
++++ b/ports/HOTD3/sdk/runtime/gpu/vulkan_present.cpp
+@@ -208,14 +208,22 @@ void VulkanRenderer::UploadGammaRamp() {
+ 
+ 
+ 
+-// the frame letterboxed into the open target: 16:9 when the console reports a widescreen display, else 4:3
++// the frame letterboxed into the open target at app::PresentAspect(): 4:3, 16:9 or 21:9
+ void VulkanRenderer::BlitFrame(Target& t, Image& bb) {
+     if (SkipPart("noblit")) return;
+-    float aspect = app::Widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f;
+     float w = float(bb.desc.w);
+     float h = float(bb.desc.h);
+-    float vw = std::min(w, h * aspect);
+-    float vh = vw / aspect;
++    // The screen is landscape. A swapchain pre-rotated by 90 or 270 degrees is turned back by the compositor, which swaps
++    // the two axes of the box, so the box is worked out in screen terms and its fractions swapped for the buffer.
++    uint32_t ww = 0, wh = 0;
++    app::WindowPixels(ww, wh);
++    const float screen = (ww && wh) ? float(std::max(ww, wh)) / float(std::min(ww, wh)) : std::max(w, h) / std::min(w, h);
++    const auto spin = swap_->Transform();
++    const bool turned = spin == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR || spin == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR;
++    const float aspect = app::PresentAspect();
++    const float fx = std::min(1.0f, aspect / screen), fy = std::min(1.0f, screen / aspect);
++    float vw = (turned ? fy : fx) * w;
++    float vh = (turned ? fx : fy) * h;
+     SetViewport((w - vw) / 2, (h - vh) / 2, vw, vh);
+     SetScissor(0, 0, int32_t(w), int32_t(h));
+     Barrier(*t.res, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+@@ -318,6 +326,10 @@ void VulkanRenderer::Present(const Surface& front) {
+     }
+     if (swap_) ConfigureSwap();
+     Target* t = EnsureTarget(front, false);
++    if (t) {
++        if (frame_targets_.size() >= 8) frame_targets_.clear();
++        frame_targets_.insert(t->data);
++    }
+     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
+     if (ramp_dirty_) UploadGammaRamp();
+     Barrier(*lut_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+diff --git a/ports/HOTD3/sdk/tests/test_shaders.cpp b/ports/HOTD3/sdk/tests/test_shaders.cpp
+index ba812d0..a1dcb2c 100644
+--- a/ports/HOTD3/sdk/tests/test_shaders.cpp
++++ b/ports/HOTD3/sdk/tests/test_shaders.cpp
+@@ -233,4 +233,5 @@ TEST("shaders: the shared constant buffer is laid out as DrawConstants") {
+     CHECK_EQ(off("wvn"), int(offsetof(DrawConstants, wvn)));
+     CHECK_EQ(off("tm"), int(offsetof(DrawConstants, tm)));
+     CHECK_EQ(off("lt"), int(offsetof(DrawConstants, lt)));
++    CHECK_EQ(off("wide"), int(offsetof(DrawConstants, wide)));
+ }
+diff --git a/ports/HOTD3/src/game/cabinet.cpp b/ports/HOTD3/src/game/cabinet.cpp
+index 8427434..0ee5633 100644
+--- a/ports/HOTD3/src/game/cabinet.cpp
++++ b/ports/HOTD3/src/game/cabinet.cpp
+@@ -80,7 +80,7 @@ void HOTD3_UpdateCabinet(X86Context& ctx, uint8_t*) {
+     Byte(reports + 4, 0);
+     const auto mouse = hotd3::ReadMouse();
+     if (mouse.active && enabled) {
+-        const auto aim = hotd3::MapMouse(mouse.x, mouse.y, mouse.width, mouse.height, app::Widescreen());
++        const auto aim = hotd3::MapMouseAspect(mouse.x, mouse.y, mouse.width, mouse.height, app::PresentAspect(), app::WideScale());
+         BigWord(reports + 16, uint16_t((aim.x + 320) * 65535u / 639u));
+         BigWord(reports + 18, uint16_t((240 - aim.y) * 65535u / 479u));
+     }
+diff --git a/ports/HOTD3/src/game/mouse.h b/ports/HOTD3/src/game/mouse.h
+index 244928f..3ab6497 100644
+--- a/ports/HOTD3/src/game/mouse.h
++++ b/ports/HOTD3/src/game/mouse.h
+@@ -14,16 +14,22 @@ struct Aim {
+ 
+ // Invert the renderer's centered presentation rectangle. SDL positions and
+ // window dimensions are both logical pixels, so display density cancels out.
+-inline Aim MapMouse(float x, float y, float width, float height, bool wide) {
+-    if (!(width > 0 && height > 0) || !std::isfinite(width) || !std::isfinite(height) ||
++inline Aim MapMouseAspect(float x, float y, float width, float height, float aspect, float squeeze) {
++    if (!(width > 0 && height > 0 && aspect > 0 && squeeze > 0) || !std::isfinite(width) || !std::isfinite(height) ||
+         !std::isfinite(x) || !std::isfinite(y)) return {};
+-    const float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
+     const float w = std::min(width, height * aspect), h = w / aspect;
+-    const float u = (x - (width - w) * 0.5f) / w;
++    const float ub = (x - (width - w) * 0.5f) / w;  // across the picture as shown
+     const float v = (y - (height - h) * 0.5f) / h;
++    // widened, the console's frame sits squeezed in the middle of the picture: undo that for the game; the extra view at the
++    // sides still counts as on screen (the position is clamped to the frame edge)
++    const float u = 0.5f + (ub - 0.5f) / squeeze;
+     return {int32_t(std::lround(std::clamp(u, 0.0f, 1.0f) * 639.0f)) - 320,
+             240 - int32_t(std::lround(std::clamp(v, 0.0f, 1.0f) * 479.0f)),
+-            u >= 0 && u < 1 && v >= 0 && v < 1};
++            ub >= 0 && ub < 1 && v >= 0 && v < 1};
++}
++
++inline Aim MapMouse(float x, float y, float width, float height, bool wide) {
++    return MapMouseAspect(x, y, width, height, wide ? 16.0f / 9.0f : 4.0f / 3.0f, 1.0f);
+ }
+ 
+ struct MouseSample {
+diff --git a/ports/HOTD3/src/game/mouse_sdl.cpp b/ports/HOTD3/src/game/mouse_sdl.cpp
+index 7cdde10..d5fadb3 100644
+--- a/ports/HOTD3/src/game/mouse_sdl.cpp
++++ b/ports/HOTD3/src/game/mouse_sdl.cpp
+@@ -91,7 +91,7 @@ void MousePad(int port, input::Pad& pad) {
+     if (port != 0) return;
+     std::lock_guard guard(lock);
+     if (!mouse.active || app::Unfocused() || app::GraphicsMenuOpen()) { buttons.Release(); return; }
+-    const auto aim = MapMouse(mouse.x, mouse.y, mouse.width, mouse.height, app::Widescreen());
++    const auto aim = MapMouseAspect(mouse.x, mouse.y, mouse.width, mouse.height, app::PresentAspect(), app::WideScale());
+     // XPP also polls on a background thread to detect connected controllers.
+     // Only the game's cabinet poll may consume a short click.
+     const uint8_t down = guest_poll ? buttons.Poll() : buttons.Peek();

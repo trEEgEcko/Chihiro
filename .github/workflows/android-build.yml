@@ -38,15 +38,16 @@ jobs:
           "$ANDROID_SDK_ROOT"/cmdline-tools/latest/bin/sdkmanager "platforms;android-35" "build-tools;36.0.0" "ndk;28.2.13676358"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "NDK=$ANDROID_SDK_ROOT/ndk/28.2.13676358" >> "$GITHUB_ENV"
-      - name: Apply OutRun2 widescreen patch
-        if: ${{ inputs.port == 'OutRun2' }}
+      - name: Apply widescreen patch (per game)
         working-directory: .
+        env:
+          PORT: ${{ inputs.port }}
         run: |
-          P=.github/workflows/outrun2_widescreen.patch
+          P=".github/workflows/$(echo "$PORT" | tr 'A-Z' 'a-z')_widescreen.patch"
           if [ -f "$P" ]; then
             git apply --check "$P"
             git apply "$P"
-            echo "widescreen patch applied"
+            echo "widescreen patch applied: $P"
           else
             echo "::warning::$P not found - building without it"
           fi
@@ -189,7 +190,6 @@ jobs:
           print("F8 pause hotkey added")
           PYEOF
       - name: Android defaults
-        if: ${{ inputs.port == 'OutRun2' }}
         run: |
           python3 - <<'PYEOF'
           import sys
@@ -233,6 +233,18 @@ jobs:
           python3 tools/prepare_game.py "/tmp/$NAME"
       - name: Generate native code
         run: python3 tools/build_native.py --generate-only --jobs 4
+      - name: Signing key
+        working-directory: .
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            echo "KEYSTORE=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+            echo "Using the saved signing key"
+          else
+            echo "::warning::secret ANDROID_KEYSTORE_B64 is not set - this build gets a new random signing key"
+          fi
       - name: Build APK
         run: python3 tools/build_android.py --jobs 4
       - uses: actions/upload-artifact@v4

@@ -1,12 +1,97 @@
+diff --git a/ports/OutRun2/sdk/runtime/app/android_bridge.cpp b/ports/OutRun2/sdk/runtime/app/android_bridge.cpp
+new file mode 100644
+index 0000000..53ff822
+--- /dev/null
++++ b/ports/OutRun2/sdk/runtime/app/android_bridge.cpp
+@@ -0,0 +1,79 @@
++// Android only: the Java overlay (org.xberecomp.GameActivity) reads and changes the settings the graphics panel has, and
++// pauses the game, through these three calls. They use only what app.h and host_pause.h already offer.
++#ifdef __ANDROID__
++#include <jni.h>
++
++#include <string>
++
++#include "app/app.h"
++#include "core/host_pause.h"
++
++namespace {
++
++std::string Text(JNIEnv* env, jstring s) {
++    if (!s) return {};
++    const char* chars = env->GetStringUTFChars(s, nullptr);
++    std::string out = chars ? chars : "";
++    if (chars) env->ReleaseStringUTFChars(s, chars);
++    return out;
++}
++
++}  // namespace
++
++extern "C" {
++
++// key: display (0 fullscreen, 1 borderless, 2 windowed), height (480, 720 or 1080), scale (render percent), aspect (0..3),
++// aniso (2, 4, 8, 16), fps (0 unlimited). Out-of-range values are ignored. The settings file is saved.
++JNIEXPORT void JNICALL Java_org_xberecomp_GameActivity_nativeSetSetting(JNIEnv* env, jclass, jstring jkey, jint value) {
++    const std::string key = Text(env, jkey);
++    app::Settings& s = app::Get();
++    if (key == "display") {
++        if (value < 0 || value > 2) return;
++        s.display_mode = static_cast<app::DisplayMode>(value);
++        app::ApplyDisplay();
++    } else if (key == "height") {
++        if (value == 480) { s.width = 640; s.height = 480; }
++        else if (value == 720) { s.width = 1280; s.height = 720; }
++        else if (value == 1080) { s.width = 1920; s.height = 1080; }
++        else return;
++        app::ApplyDisplay();
++    } else if (key == "scale") {
++        if (value < 25 || value > 300) return;
++        s.render_percent = static_cast<uint32_t>(value);
++    } else if (key == "aspect") {
++        if (value < 0 || value > 3) return;
++        s.aspect = static_cast<uint32_t>(value);
++    } else if (key == "aniso") {
++        if (value != 0 && value != 2 && value != 4 && value != 8 && value != 16) return;
++        s.aniso = static_cast<uint32_t>(value);
++    } else if (key == "fps") {
++        if (value < 0 || value > 1000) return;
++        s.fps_cap = static_cast<uint32_t>(value);
++    } else {
++        return;
++    }
++    app::Save();
++}
++
++// the same keys, plus paused (0 or 1); -1 for a key it does not know. height is 0 while the output is the desktop mode.
++JNIEXPORT jint JNICALL Java_org_xberecomp_GameActivity_nativeGetSetting(JNIEnv* env, jclass, jstring jkey) {
++    const std::string key = Text(env, jkey);
++    const app::Settings& s = app::Get();
++    if (key == "display") return static_cast<jint>(s.display_mode);
++    if (key == "height") return static_cast<jint>(s.height);
++    if (key == "scale") return static_cast<jint>(s.render_percent);
++    if (key == "aspect") return static_cast<jint>(s.aspect);
++    if (key == "aniso") return static_cast<jint>(s.aniso);
++    if (key == "fps") return static_cast<jint>(s.fps_cap);
++    if (key == "paused") return host::Pause().Paused() ? 1 : 0;
++    return -1;
++}
++
++// a plain pause: the guest's clocks and audio stop, the window keeps running; not while the graphics panel is open
++JNIEXPORT void JNICALL Java_org_xberecomp_GameActivity_nativeTogglePause(JNIEnv*, jclass) {
++    if (app::GraphicsMenuOpen()) return;
++    host::Pause().Set(!host::Pause().Paused());
++}
++
++}  // extern "C"
++#endif
 diff --git a/ports/OutRun2/sdk/runtime/app/app.h b/ports/OutRun2/sdk/runtime/app/app.h
-index 261bafb..96a07f7 100644
+index 261bafb..ead3776 100644
 --- a/ports/OutRun2/sdk/runtime/app/app.h
 +++ b/ports/OutRun2/sdk/runtime/app/app.h
 @@ -33,6 +33,7 @@ struct Settings {
      bool vsync = true;
  #endif
      uint32_t aniso = 0;              // 0 as the game asks
-+    uint32_t aspect = 0;             // 0 native 4:3, 1 widescreen 16:9, 2 ultrawide 21:9 (aspect_ratio in the settings file)
++    uint32_t aspect = 0;             // 0 native 4:3, 1 widescreen 16:9, 2 ultrawide 21:9, 3 fit the screen (aspect_ratio in the settings file)
      std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
  };
  
@@ -14,7 +99,7 @@ index 261bafb..96a07f7 100644
  float RenderScale(uint32_t guest_height);
  // the output is 3:2 or wider: the console reports a widescreen TV and the frame is shown 16:9, else 4:3 as on a 4:3 TV
  bool Widescreen();
-+// the aspect the frame is shown at, from Settings::aspect: 4:3, 16:9 or 21:9
++// the aspect the frame is shown at, from Settings::aspect: 4:3, 16:9, 21:9 or the window's own shape
 +float PresentAspect();
 +// 4:3 divided by PresentAspect(): the factor the frame's x clip coordinates are squeezed by, 1 for native 4:3. The console
 +// always renders 4:3; squeezing x by this and showing the frame PresentAspect() wide keeps shapes square and adds view at the sides
@@ -23,15 +108,15 @@ index 261bafb..96a07f7 100644
  std::filesystem::path ExeDir();
  // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc
 diff --git a/ports/OutRun2/sdk/runtime/app/graphics_menu.cpp b/ports/OutRun2/sdk/runtime/app/graphics_menu.cpp
-index a04a54b..b2f6871 100644
+index a04a54b..3b9a10e 100644
 --- a/ports/OutRun2/sdk/runtime/app/graphics_menu.cpp
 +++ b/ports/OutRun2/sdk/runtime/app/graphics_menu.cpp
 @@ -92,6 +92,9 @@ void DrawGraphicsMenu(double fps) {
          int scale = int(draft.render_percent);
          if (ImGui::SliderInt("Render scale", &scale, 25, 300, "%d%%")) draft.render_percent=uint32_t(scale);
          ImGui::TextWrapped("100%% renders at the selected output height. Higher values supersample; lower values reduce GPU load.");
-+        const uint32_t aspects[] = {0,1,2};
-+        const char* const aspect_names[] = {"Native 4:3", "Widescreen 16:9 (wider view)", "Ultrawide 21:9 (wider view)"};
++        const uint32_t aspects[] = {0,1,2,3};
++        const char* const aspect_names[] = {"Native 4:3", "Widescreen 16:9 (wider view)", "Ultrawide 21:9 (wider view)", "Fit screen (wider view, no bars)"};
 +        Choice("Aspect ratio",draft.aspect,aspects,aspect_names);
          const uint32_t filters[] = {0,2,4,8,16};
          const char* const filter_names[] = {"Game default", "2x", "4x", "8x", "16x"};
@@ -46,7 +131,7 @@ index a04a54b..b2f6871 100644
              ApplyDisplay(); Save();
          }
 diff --git a/ports/OutRun2/sdk/runtime/app/settings.cpp b/ports/OutRun2/sdk/runtime/app/settings.cpp
-index cbcbde2..fb26b98 100644
+index cbcbde2..ad91839 100644
 --- a/ports/OutRun2/sdk/runtime/app/settings.cpp
 +++ b/ports/OutRun2/sdk/runtime/app/settings.cpp
 @@ -52,6 +52,8 @@ void Load() {
@@ -54,7 +139,7 @@ index cbcbde2..fb26b98 100644
      s.vsync = t["vsync"].value_or(s.vsync);
      s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
 +    s.aspect = t["aspect_ratio"].value_or(s.aspect);
-+    if (s.aspect > 2) s.aspect = 0;
++    if (s.aspect > 3) s.aspect = 0;
      s.join_ip = t["join_ip"].value_or(s.join_ip);
      for (const Option& o : kGame.options) {
          if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
@@ -66,7 +151,7 @@ index cbcbde2..fb26b98 100644
                    {"join_ip", s.join_ip}};
      for (const Option& o : kGame.options) {
          if (o.flag) t.insert(o.key, *o.flag);
-@@ -131,6 +134,16 @@ bool Widescreen() {
+@@ -131,6 +134,22 @@ bool Widescreen() {
      return wide;
  }
  
@@ -74,6 +159,12 @@ index cbcbde2..fb26b98 100644
 +    switch (Get().aspect) {
 +        case 1: return 16.0f / 9.0f;
 +        case 2: return 21.0f / 9.0f;
++        case 3: {  // fit the screen: the box is the window's own shape, so nothing is left black
++            uint32_t w = 0, h = 0;
++            WindowPixels(w, h);
++            if (w && h) return float(w > h ? w : h) / float(w > h ? h : w);
++            return 16.0f / 9.0f;
++        }
 +        default: return 4.0f / 3.0f;
 +    }
 +}
@@ -84,7 +175,7 @@ index cbcbde2..fb26b98 100644
      float h = Output().height * (Get().render_percent / 100.0f);
      return guest_height ? std::max(h / guest_height, 0.1f) : 1.0f;
 diff --git a/ports/OutRun2/sdk/runtime/app/window_sdl.cpp b/ports/OutRun2/sdk/runtime/app/window_sdl.cpp
-index e189d6e..5d82e64 100644
+index e189d6e..aa61d52 100644
 --- a/ports/OutRun2/sdk/runtime/app/window_sdl.cpp
 +++ b/ports/OutRun2/sdk/runtime/app/window_sdl.cpp
 @@ -91,6 +91,10 @@ void ApplyNow() {
@@ -92,7 +183,7 @@ index e189d6e..5d82e64 100644
  // the scancode's virtual key, as the window would have been sent it
  void OnKey(const SDL_KeyboardEvent& k) {
 +    if (k.scancode == SDL_SCANCODE_F9) {
-+        if (k.down && !k.repeat) { Settings& st = Get(); st.aspect = (st.aspect + 1) % 3; Save(); }
++        if (k.down && !k.repeat) { Settings& st = Get(); st.aspect = (st.aspect + 1) % 4; Save(); }
 +        return;
 +    }
      if (k.scancode == SDL_SCANCODE_F10) {

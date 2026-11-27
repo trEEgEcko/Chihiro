@@ -38,6 +38,18 @@ jobs:
           "$ANDROID_SDK_ROOT"/cmdline-tools/latest/bin/sdkmanager "platforms;android-35" "build-tools;36.0.0" "ndk;28.2.13676358"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "NDK=$ANDROID_SDK_ROOT/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - name: Apply OutRun2 widescreen patch
+        if: ${{ inputs.port == 'OutRun2' }}
+        working-directory: .
+        run: |
+          P=.github/workflows/outrun2_widescreen.patch
+          if [ -f "$P" ]; then
+            git apply --check "$P"
+            git apply "$P"
+            echo "widescreen patch applied"
+          else
+            echo "::warning::$P not found - building without it"
+          fi
       - name: Apply aspect ratio patch
         run: |
           python3 - <<'PYEOF'
@@ -156,27 +168,43 @@ jobs:
                   print("::warning::mouse.h layout differs, touch aim not updated")
           print("aim fix applied")
           PYEOF
-      - name: Wire test/service switches
+      - name: Add pause hotkey (F8)
         run: |
           python3 - <<'PYEOF'
-          import os
-          cab = "src/game/cabinet.cpp"
-          if not os.path.exists(cab):
-              print("no cabinet.cpp"); raise SystemExit
-          t = open(cab).read()
-          if "app::TestSwitch" in t:
-              print("test/service already present"); raise SystemExit
-          n = 0
+          import sys
+          f = "sdk/runtime/app/window_sdl.cpp"
+          s = open(f).read()
+          if "SDL_SCANCODE_F8" in s:
+              print("pause hotkey already present"); sys.exit(0)
+          if '"core/host_pause.h"' not in s:
+              k = s.index('#include "')
+              e = s.index("\n", k)
+              s = s[:e + 1] + '#include "core/host_pause.h"\n' + s[e + 1:]
+          old = "    if (k.scancode == SDL_SCANCODE_F10) {\n"
+          new = ("    if (k.scancode == SDL_SCANCODE_F8) {\n"
+                 "        if (k.down && !k.repeat && !GraphicsMenuOpen()) host::Pause().Set(!host::Pause().Paused());\n"
+                 "        return;\n    }\n") + old
+          if old not in s: sys.exit("F8 anchor not found")
+          open(f, "w").write(s.replace(old, new, 1))
+          print("F8 pause hotkey added")
+          PYEOF
+      - name: Android defaults
+        if: ${{ inputs.port == 'OutRun2' }}
+        run: |
+          python3 - <<'PYEOF'
+          import sys
+          f = "sdk/runtime/app/app.h"
+          s = open(f).read()
           for old, new in [
-              ("    Byte(reports, 0);\n", "    Byte(reports, enabled && app::TestSwitch() ? 0x80 : 0);\n"),
-              ("    Byte(reports, 0); // System/test switch.\n", "    Byte(reports, enabled && app::TestSwitch() ? 0x80 : 0); // System/test switch.\n"),
-              ("(pad.analog[0] ? 2 : 0) | (pad.analog[1] ? 1 : 0)) : 0);", "(pad.analog[0] ? 2 : 0) | (pad.analog[1] ? 1 : 0) | (app::ServiceSwitch() ? 0x40 : 0)) : 0);"),
-              ("         (pad.analog[0] ? 2 : 0)) : 0);", "         (pad.analog[0] ? 2 : 0) | (app::ServiceSwitch() ? 0x40 : 0)) : 0);"),
+              ("DisplayMode display_mode = DisplayMode::Borderless;", "DisplayMode display_mode = DisplayMode::Fullscreen;"),
+              ("    uint32_t fps_cap = 0;            // 0 unlimited", "    uint32_t fps_cap = 60;           // 0 unlimited"),
+              ("    uint32_t aniso = 0;              // 0 as the game asks", "    uint32_t aniso = 2;              // 0 as the game asks"),
           ]:
-              if old in t:
-                  t = t.replace(old, new, 1); n += 1
-          open(cab, "w").write(t)
-          print("test/service switches wired (%d edits)" % n)
+              if old not in s:
+                  print("::warning::default anchor not found: " + old); continue
+              s = s.replace(old, new, 1)
+          open(f, "w").write(s)
+          print("android defaults set: fullscreen, 60 fps, 2x filtering (aspect stays native 4:3)")
           PYEOF
       - name: Apply HUD patch (icon, buttons, layout)
         working-directory: .

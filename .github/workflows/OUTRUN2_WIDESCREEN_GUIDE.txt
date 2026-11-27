@@ -1,0 +1,218 @@
+OUTRUN 2 ANDROID - SELECTABLE ASPECT RATIO (NATIVE 4:3 / WIDESCREEN 16:9 / ULTRAWIDE 21:9)
+Implementation, patch, build and validation guide
+=====================================================================================
+
+0. SOURCE OF TRUTH AND WHAT WAS AND WAS NOT CHECKED
+---------------------------------------------------
+Source analysed: the uploaded archive Chihiro-XBERecomp-main.zip (the trEEgEcko/Chihiro fork sources), port
+ports/OutRun2 only. An attempt to read https://github.com/trEEgEcko/Chihiro directly failed (fetch rate limit), so
+nothing in this guide depends on the live repository page; the patch was generated and applied against the archive.
+
+Checked by reading the repository code (every item below was read, none assumed):
+  - matrix storage and how the renderer composes them (gpu/state.h, gpu/vulkan.cpp)
+  - viewport structure and how the guest viewport reaches the host (gpu/state.h, gpu/vulkan.cpp)
+  - the shader constant buffer shared by the C++ and the generated HLSL (gpu/shaders.h, gpu/shaders.cpp)
+  - settings storage (app/app.h, app/settings.cpp, TOML via toml++)
+  - the Android graphics menu (app/graphics_menu.cpp, ImGui)
+  - presentation of the frame (gpu/vulkan_present.cpp)
+  - the pause mechanism (core/host_pause.h)
+
+NOT checkable here, and therefore NOT verified:
+  - OutRun 2's own matrix state at run time. The game executable (the XBE) is not in the repository and the game was not
+    run. Which draws the title makes with fixed function matrices, which with vertex programs, its vertical FOV and its
+    frustum culling are unknown. The design below was therefore built so that it does not depend on that knowledge.
+  - A full compile. The authoring environment has no Vulkan SDK, SDL3, toml++ or Android NDK. What WAS done: the patch
+    applies cleanly to the pristine archive (git apply --check and patch -p1 --dry-run), the edited text was reviewed,
+    the new Java was syntax-checked, and the geometry formulas were checked numerically. Build it (section 6) before
+    trusting it.
+  - Behaviour on the device. Section 8 is the test plan.
+
+1. DESIGN (WHAT THE CODE DOES AND WHY)
+--------------------------------------
+1.1 Facts found in the code
+  - The console always renders 4:3. The host render target is the guest surface size times ONE scalar:
+    scale_ = app::RenderScale(guest_h) (settings.cpp, vulkan.cpp). The Output resolution setting only contributes its
+    HEIGHT to that scalar. So the frame target is always 4:3 (640x480 times the scale).
+  - The frame is put on screen by VulkanRenderer::BlitFrame (vulkan_present.cpp), which letterboxes the frame target into
+    the swapchain image inside a viewport box. Before this patch the box was 16:9 if app::Widescreen() else 4:3.
+    app::Widescreen() only derives from the Output resolution aspect; the guest is never told about it.
+  - Matrices: State::transforms is std::array<std::array<float,16>,512>, indexed by D3DTRANSFORMSTATETYPE, row-major,
+    row-vector convention (v * M). kTsView = 2, kTsProjection = 3, kTsWorld = 256 (vulkan.cpp). MatMul(x,y,o) computes
+    o = x * y with o[r*4+c] = sum_k x[r*4+k] * y[k*4+c]. FillTransformConstants builds world*view*projection*vpm and
+    uploads it transposed as DrawConstants::wvp (and wv, wvn, and the three blend sets) for the fixed function path.
+    Programmable vertex programs get their constants in State::vsc (192 float4, hardware order = D3D register + 96).
+  - Viewport: struct Viewport { uint32_t x, y, w, h; float min_z, max_z; } (state.h). The guest viewport is applied in the
+    shader (vpm in FillTransformConstants; the epilogue maps window pixels to clip), the host viewport covers the whole
+    target and the scissor clips to the guest viewport (SetViewportScissor).
+  - Every vertex shader, fixed function and programmable alike, ends in the same epilogue (kVsEpilogue in shaders.cpp):
+    window pixel position p -> q.x = p.x*2/surf.x - 1, q.y = 1 - p.y*2/surf.y, q.xyz *= p.w. Pre-transformed (screen
+    space, XYZRHW) draws enter it as window pixels too.
+  - Settings: app::Settings (app.h), read in app::Load() with toml++ (t["key"].value_or(default)), written by Table() in
+    settings.cpp; the file name is kGame.settings = "settings.toml" (src/common/game_info.cpp), in app::ExeDir().
+  - Android graphics menu: DrawGraphicsMenu in graphics_menu.cpp, ImGui, edits a copy "draft" and commits on
+    "Apply and save" (ApplyDisplay(); Save()). Choice(label, value, values, names) is the combo helper.
+
+1.2 The approach
+  Let A = the chosen aspect (4/3, 16/9 or 21/9) and k = (4/3) / A  (1, 0.75, 0.5714).
+  a) Vertex stage, every draw to the frame target: q.x *= k (one line in the epilogue, fed by a new DrawConstants member
+     "wide"). For the fixed function path this is exactly the same as multiplying column 0 of the projection matrix by k
+     (clip.x = sum_r v_r * P[r][0]); for vertex programs it is the same operation on the program's own output, which is
+     the only way to reach a projection the renderer never sees as a matrix. It changes only x: vertical FOV, depth (z, w)
+     and every y are untouched.
+  b) Presentation: the (still 4:3) frame target is shown in a box of aspect A instead of 4:3/16:9. Squeezing x by k and
+     showing the frame 1/k wider cancel exactly, so objects stay square. World geometry that used to lie outside the 4:3
+     frustum edge now falls inside the wider picture: horizontal FOV grows, vertical FOV is unchanged.
+  c) The 2D HUD and menus are drawn with pre-transformed vertices through the same epilogue, so they get the same squeeze
+     and the same 1/k widening: their shapes stay natural, their layout is unchanged and sits centred in a 4:3 area. Their
+     geometry is not otherwise touched.
+  d) Native 4:3 (default): k = 1, box 4:3, so the output is the original image.
+
+  Numeric check (illustration only, assumes a 45 degree vertical FOV because OutRun 2's real value is unknown):
+     mode     k       horizontal FOV    shape of a unit object on screen (w/h)
+     4:3      1.0000   57.82 deg         1.0000
+     16:9     0.7500   72.73 deg         1.0000
+     21:9     0.5714   88.05 deg         1.0000
+
+1.3 Which draws are squeezed
+  Only draws whose bound render target is a "frame target": the guest surface(s) passed to Present() (tracked in
+  VulkanRenderer::frame_targets_, at most 8 addresses) plus any same-size target that the title copies INTO one of them
+  (Copy()). Shadow maps, reflections and other offscreen targets are not squeezed. Before the first Present nothing is
+  squeezed.
+
+1.4 Deliberate departures from the literal wording of the request (read these)
+  - "Do not stretch the framebuffer": the frame target is 4:3 because the runtime derives every host target size from a
+    single scalar (scale_) and maps guest coordinates to targets uniformly (SetViewportScissor uses one scale for both
+    axes, among others). A genuinely wider render target would need a non-uniform guest-to-target mapping through target
+    creation, scissors, copies, read-backs and every screen pass. That cannot be done safely without running the game.
+    Instead the picture is anamorphic: squeezed in the projection and un-squeezed on presentation. Shapes on screen are
+    square (section 1.2), there is no crop and no zoom; but strictly speaking the presented image is a horizontally
+    resampled 4:3 target.
+  - "Separate world geometry and HUD/layout projection": the code has one vertex epilogue for everything and the renderer
+    does not know which programmable draws are 2D. Both are squeezed by the same factor; as shown in 1.2 c) that is the
+    correct treatment for each (extra world at the sides, natural-shaped centred HUD). Full-screen 2D quads (backgrounds,
+    fades) therefore cover the central 4:3 area only.
+  - "Expand the 3D projection's horizontal field of view through the projection matrices": done at the clip-space output
+    of the vertex stage (equivalent to scaling the projection's x column, see 1.2 a) so that vertex programs are covered
+    too. FillTransformConstants was not modified.
+  - ports/OutRun2/config/game.toml was NOT modified: it is the static-recompilation configuration of the game, not the
+    settings file. The setting is persisted in settings.toml as "aspect_ratio" (0 = native 4:3, 1 = 16:9, 2 = 21:9; any
+    other stored value is reset to 0 on load).
+  - gpu/d3d12.cpp was NOT modified: the Windows backend is out of scope for an Android-only build. It shares
+    DrawConstants and the HLSL, never fills the new member (zero), and the shader treats zero as 1, so it is unchanged.
+  - gpu/state.h was not modified: no new guest state is needed.
+
+2. EXACT LIST OF MODIFIED FILES
+-------------------------------
+Native source and tests (all in outrun2_widescreen.patch, paths relative to the repository root):
+  ports/OutRun2/sdk/runtime/app/app.h                 Settings::aspect; declarations of PresentAspect() and WideScale()
+  ports/OutRun2/sdk/runtime/app/settings.cpp          load/save "aspect_ratio"; PresentAspect(); WideScale()
+  ports/OutRun2/sdk/runtime/app/graphics_menu.cpp     "Aspect ratio" combo; committed on "Apply and save"
+  ports/OutRun2/sdk/runtime/app/window_sdl.cpp        F9 cycles the three modes (the Android HUD aspect button sends F9)
+  ports/OutRun2/sdk/runtime/gpu/shaders.h             DrawConstants::wide[4]
+  ports/OutRun2/sdk/runtime/gpu/shaders.cpp           cbuffer member "float4 wide"; x squeeze in the vertex epilogue
+  ports/OutRun2/sdk/runtime/gpu/vulkan.h              frame_targets_ (std::unordered_set<uint32_t>)
+  ports/OutRun2/sdk/runtime/gpu/vulkan.cpp            wide constant in UploadConstants; frame target propagation in Copy()
+  ports/OutRun2/sdk/runtime/gpu/vulkan_present.cpp    BlitFrame box from PresentAspect() with pre-rotation handling;
+                                                      frame target registration in Present()
+  ports/OutRun2/sdk/tests/test_shaders.cpp            layout test also checks the offset of "wide"
+Named in the request but NOT modified: gpu/d3d12.cpp, gpu/state.h and config/game.toml (reasons in 1.4).
+(gpu/vulkan.cpp IS modified, see the list above.)
+
+Build and packaging files (outside the patch, delivered next to it):
+  android-build.yml            the GitHub Actions workflow (steps added/removed, section 5)
+  outrun2_patch.zip            Android resources and Java (HUD, icon, launcher/game activity)
+  outrun2_widescreen.patch     the unified diff
+
+Android pre-rotation note: BlitFrame now works the box out in screen terms and swaps its two fractions when the swapchain
+is pre-rotated by 90 or 270 degrees. This fixes a defect seen on the target phone: with the original arithmetic the
+4:3 and 16:9 boxes appeared as full-width bars at the top and bottom instead of bars at the sides (the compositor
+transposes the buffer; measured heights of 864 and 648 pixels on a 2400x1080 screen matched the transposed boxes).
+
+3. THE UNIFIED DIFF
+-------------------
+The complete diff is the file outrun2_widescreen.patch (226 lines, git format, paths a/ports/OutRun2/... b/ports/...).
+It is delivered as a file because it is generated and checked against the archive; the guide does not retype it.
+
+4. APPLYING THE PATCH
+---------------------
+Option A - through the GitHub workflow (no PC):
+  1. In the fork, Add file > Upload files, and put outrun2_widescreen.patch in the folder .github/workflows/.
+  2. Replace .github/workflows/android-build.yml with the delivered one. Its step "Apply OutRun2 widescreen patch" runs
+     "git apply --check" and then "git apply" on that file before anything else touches the sources.
+  3. Replace .github/workflows/outrun2_patch.zip with the delivered one.
+Option B - on a PC, in a clone of the fork:
+  cd Chihiro
+  git apply --check outrun2_widescreen.patch
+  git apply outrun2_widescreen.patch
+  git add -A && git commit -m "OutRun 2: selectable aspect ratio"
+Revert: git apply -R outrun2_widescreen.patch
+
+If the older CI aspect steps are still in the workflow they detect the patch ("aspect_ratio" and "PresentAspect" already
+present) and do nothing. Choosing Native 4:3 reproduces the original 4:3 image, i.e. what the unpatched build shows with a 4:3 box (the new shader
+factor is 1.0). The unpatched build's own default on a wide Output resolution was an anamorphic 16:9 box; that default is gone.
+
+5. WHAT THE DELIVERED WORKFLOW DOES (android-build.yml)
+-------------------------------------------------------
+Steps, in order (workflow_dispatch input "port"; use OutRun2):
+  Host tools; Android SDK / NDK; Apply OutRun2 widescreen patch; Apply aspect ratio patch (no-op after the patch);
+  Add F9 aspect hotkey (no-op after the patch); Fix touch aim for aspect modes (no-op for OutRun 2);
+  Add pause hotkey (F8): F8 toggles a pure pause using host::Pause().Set() (the guest clocks and audio stop, the window
+    keeps running, no settings panel); ignored while the graphics panel is open;
+  Android defaults (OutRun2 only, take effect when no settings.toml exists yet): Fullscreen, 60 FPS limit, 2x texture
+    filtering; aspect stays Native 4:3 as required;
+  Apply HUD patch (unzips .github/workflows/outrun2_patch.zip); Fetch game archive (secret GAME_ARCHIVE_URL must be the
+    Outrun 2.7z link); Generate native code; Build APK; upload artifact OutRun2-apk.
+Removed from the workflow: the Test/Service wiring (it froze the game).
+In outrun2_patch.zip: the HUD no longer has Test/Service buttons; the pause icon sends F8 (pure pause); the hamburger
+opens Quick options with HUD opacity, Restart game, Exit to menu and Close (the graphics panel is no longer offered
+there; R3/F10 on a gamepad or keyboard still opens it); Exit to menu returns to the launcher screen.
+
+6. ANDROID BUILD COMMANDS
+-------------------------
+Requirements (android/README.md): Android SDK 35, build-tools 36.0.0, NDK 28.2.13676358, JDK 17, Python 3, cmake, ninja,
+clang, p7zip. From ports/OutRun2 in the patched repository:
+  python3 tools/prepare_game.py "/path/to/Outrun 2.7z"
+  python3 tools/build_native.py --generate-only --jobs 3
+  python3 tools/build_android.py --jobs 3
+The APK is written under ports/OutRun2/android/build/. Optional flags of build_android.py: --deps-source, --deps-build,
+--package-only. Source checks that need no game files: python3 tools/check_sources.py. Importer/launcher checks:
+python3 -m unittest discover -s tests -v. Native GPU/input checks (including the extended layout test in
+sdk/tests/test_shaders.cpp) run through: ctest --preset linux-release, after building their targets on a suitable Vulkan
+host.
+On GitHub: Actions > Android build > Run workflow > port OutRun2. The APK is the artifact "OutRun2-apk". A new signing key
+is generated each run, so uninstall any previous build first.
+
+7. USING IT
+-----------
+Graphics settings panel (opened with R3 on a gamepad or F10 on a keyboard; the touch HUD no longer opens it, so on a
+phone without a gamepad the HUD aspect icon is the way to change the mode) > Aspect ratio: Native 4:3, Widescreen 16:9 (wider
+view), Ultrawide 21:9 (wider view); "Apply and save" writes aspect_ratio to settings.toml. The HUD aspect icon sends F9
+and cycles the three modes, saving each time. On a 20:9 phone 21:9 leaves thin bars at the top and bottom (21:9 is
+narrower than 20:9 by height); 16:9 leaves bars at the sides.
+
+8. VALIDATION PLAN
+------------------
+  1. Native 4:3: a 4:3 picture with bars at the sides (the unpatched 4:3 image). Nothing logged about widescreen.
+  2. Choose 16:9 and race. Expected log line (once): "vulkan: widescreen x scale 0.7500 on frame target XXXXXXXX".
+     21:9 logs 0.5714. If the line never appears the game does not render into a presented target (it draws offscreen and
+     copies in a way this code does not see): report it, the picture would then be wrongly stretched.
+  3. Shape test: wheels must be round, the speedometer circular, the car not widened. At the screen edges there must be
+     scenery that native 4:3 cannot show (more road side, buildings).
+  4. HUD: gauge, timers and score keep natural proportions and appear in a central 4:3 block.
+  5. Menus (car select) appear as a centred 4:3 picture with natural shapes.
+  6. Watch for: fades or transitions that cover only the centre; objects popping in at the side edges; reflections or
+     post effects misplaced; doubled squeeze on any full-screen effect.
+  7. Rotate the phone 180 degrees (sensorLandscape): the picture must stay correctly boxed.
+  8. Pause icon: the game freezes without opening the settings panel; pressing it again resumes.
+  9. Persistence: set 21:9, Exit to menu, Start game: the setting must remain.
+
+9. KNOWN LIMITATIONS AND RISKS
+------------------------------
+  - Frustum culling is done by the game on the CPU against its own 4:3 frustum; objects just outside it are not submitted,
+    so some pop-in at the new side edges is expected. Fixing it needs a change in the game code, not in the renderer.
+  - Effects that sample the frame target (post processing) may be squeezed twice if the title renders a scene to one
+    target and draws it to the frame through a pre-transformed quad. Not observable without running the game.
+  - The frame target set is limited to 8 addresses and cleared if exceeded.
+  - Full-screen 2D quads are confined to the central 4:3 area.
+  - 21:9 on a 20:9 display is letterboxed by about 5 percent of the height.
+  - d3d12 (Windows) does not implement the squeeze; Android builds use Vulkan only.

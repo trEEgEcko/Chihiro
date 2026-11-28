@@ -1,9 +1,9 @@
 diff --git a/ports/OutRun2/sdk/runtime/app/android_bridge.cpp b/ports/OutRun2/sdk/runtime/app/android_bridge.cpp
 new file mode 100644
-index 0000000..53ff822
+index 0000000..e91acfa
 --- /dev/null
 +++ b/ports/OutRun2/sdk/runtime/app/android_bridge.cpp
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,80 @@
 +// Android only: the Java overlay (org.xberecomp.GameActivity) reads and changes the settings the graphics panel has, and
 +// pauses the game, through these three calls. They use only what app.h and host_pause.h already offer.
 +#ifdef __ANDROID__
@@ -38,10 +38,11 @@ index 0000000..53ff822
 +        s.display_mode = static_cast<app::DisplayMode>(value);
 +        app::ApplyDisplay();
 +    } else if (key == "height") {
-+        if (value == 480) { s.width = 640; s.height = 480; }
-+        else if (value == 720) { s.width = 1280; s.height = 720; }
-+        else if (value == 1080) { s.width = 1920; s.height = 1080; }
-+        else return;
++        if (value != 480 && value != 720 && value != 1080) return;
++        // a fixed output size would shrink the window to that shape; keep the desktop mode and render at this height
++        s.render_height = static_cast<uint32_t>(value);
++        s.width = 0;
++        s.height = 0;
 +        app::ApplyDisplay();
 +    } else if (key == "scale") {
 +        if (value < 25 || value > 300) return;
@@ -66,7 +67,7 @@ index 0000000..53ff822
 +    const std::string key = Text(env, jkey);
 +    const app::Settings& s = app::Get();
 +    if (key == "display") return static_cast<jint>(s.display_mode);
-+    if (key == "height") return static_cast<jint>(s.height);
++    if (key == "height") return static_cast<jint>(s.render_height ? s.render_height : s.height);
 +    if (key == "scale") return static_cast<jint>(s.render_percent);
 +    if (key == "aspect") return static_cast<jint>(s.aspect);
 +    if (key == "aniso") return static_cast<jint>(s.aniso);
@@ -84,10 +85,20 @@ index 0000000..53ff822
 +}  // extern "C"
 +#endif
 diff --git a/ports/OutRun2/sdk/runtime/app/app.h b/ports/OutRun2/sdk/runtime/app/app.h
-index 261bafb..ead3776 100644
+index 261bafb..4198f05 100644
 --- a/ports/OutRun2/sdk/runtime/app/app.h
 +++ b/ports/OutRun2/sdk/runtime/app/app.h
-@@ -33,6 +33,7 @@ struct Settings {
+@@ -18,7 +18,8 @@ enum class DisplayMode : uint32_t { Fullscreen, Borderless, Windowed };
+ struct Settings {
+     DisplayMode display_mode = DisplayMode::Borderless;
+     uint32_t width = 0, height = 0;  // 0 is the desktop mode
+-    uint32_t render_percent = 100;   // of the output height
++    uint32_t render_percent = 100;   // of the render height
++    uint32_t render_height = 0;      // the height the frame is rendered at (Android Quick options); 0 follows the output resolution
+ #ifdef __ANDROID__
+     uint32_t fps_cap = 0;            // 0 unlimited
+ #else
+@@ -33,6 +34,7 @@ struct Settings {
      bool vsync = true;
  #endif
      uint32_t aniso = 0;              // 0 as the game asks
@@ -95,7 +106,7 @@ index 261bafb..ead3776 100644
      std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
  };
  
-@@ -50,6 +51,11 @@ Mode Output();
+@@ -50,6 +52,11 @@ Mode Output();
  float RenderScale(uint32_t guest_height);
  // the output is 3:2 or wider: the console reports a widescreen TV and the frame is shown 16:9, else 4:3 as on a 4:3 TV
  bool Widescreen();
@@ -131,10 +142,15 @@ index a04a54b..3b9a10e 100644
              ApplyDisplay(); Save();
          }
 diff --git a/ports/OutRun2/sdk/runtime/app/settings.cpp b/ports/OutRun2/sdk/runtime/app/settings.cpp
-index cbcbde2..ad91839 100644
+index cbcbde2..b60f40e 100644
 --- a/ports/OutRun2/sdk/runtime/app/settings.cpp
 +++ b/ports/OutRun2/sdk/runtime/app/settings.cpp
-@@ -52,6 +52,8 @@ void Load() {
+@@ -49,9 +49,13 @@ void Load() {
+     s.width = t["width"].value_or(s.width);
+     s.height = t["height"].value_or(s.height);
+     s.render_percent = t["render_percent"].value_or(s.render_percent);
++    s.render_height = t["render_height"].value_or(s.render_height);
++    if (s.render_height > 4320) s.render_height = 0;
      s.fps_cap = t["fps_cap"].value_or(s.fps_cap);
      s.vsync = t["vsync"].value_or(s.vsync);
      s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
@@ -143,7 +159,11 @@ index cbcbde2..ad91839 100644
      s.join_ip = t["join_ip"].value_or(s.join_ip);
      for (const Option& o : kGame.options) {
          if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
-@@ -73,6 +75,7 @@ toml::table Table() {
+@@ -70,9 +74,11 @@ toml::table Table() {
+                   {"width", int64_t(s.width)},
+                   {"height", int64_t(s.height)},
+                   {"render_percent", int64_t(s.render_percent)},
++                  {"render_height", int64_t(s.render_height)},
                    {"fps_cap", int64_t(s.fps_cap)},
                    {"vsync", s.vsync},
                    {"anisotropic_filtering", int64_t(s.aniso)},
@@ -151,7 +171,7 @@ index cbcbde2..ad91839 100644
                    {"join_ip", s.join_ip}};
      for (const Option& o : kGame.options) {
          if (o.flag) t.insert(o.key, *o.flag);
-@@ -131,6 +134,22 @@ bool Widescreen() {
+@@ -131,8 +137,24 @@ bool Widescreen() {
      return wide;
  }
  
@@ -172,10 +192,13 @@ index cbcbde2..ad91839 100644
 +float WideScale() { return (4.0f / 3.0f) / PresentAspect(); }
 +
  float RenderScale(uint32_t guest_height) {
-     float h = Output().height * (Get().render_percent / 100.0f);
+-    float h = Output().height * (Get().render_percent / 100.0f);
++    float h = (Get().render_height ? Get().render_height : Output().height) * (Get().render_percent / 100.0f);
      return guest_height ? std::max(h / guest_height, 0.1f) : 1.0f;
+ }
+ 
 diff --git a/ports/OutRun2/sdk/runtime/app/window_sdl.cpp b/ports/OutRun2/sdk/runtime/app/window_sdl.cpp
-index e189d6e..aa61d52 100644
+index e189d6e..eb24a84 100644
 --- a/ports/OutRun2/sdk/runtime/app/window_sdl.cpp
 +++ b/ports/OutRun2/sdk/runtime/app/window_sdl.cpp
 @@ -91,6 +91,10 @@ void ApplyNow() {
@@ -189,6 +212,17 @@ index e189d6e..aa61d52 100644
      if (k.scancode == SDL_SCANCODE_F10) {
          if (k.down && !k.repeat) ToggleGraphicsMenu();
          return;
+@@ -406,6 +410,10 @@ void SetUnhandledKey(std::function<void(int)> f) { g_unhandled_key = std::move(f
+ 
+ bool OpenWindow(const std::string& title) {
+     g_event_base = SDL_RegisterEvents(2);
++#if defined(__ANDROID__)
++    // a resizable window leaves the orientation to the phone, which kept the game in portrait when rotation is locked
++    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
++#endif
+     g_window = SDL_CreateWindow(title.c_str(), 1280, 720,
+                                 SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN);
+     if (!g_window) {
 diff --git a/ports/OutRun2/sdk/runtime/gpu/shaders.cpp b/ports/OutRun2/sdk/runtime/gpu/shaders.cpp
 index da10839..0c31494 100644
 --- a/ports/OutRun2/sdk/runtime/gpu/shaders.cpp

@@ -48,6 +48,8 @@ jobs:
             git apply --check "$P"
             git apply "$P"
             echo "widescreen patch applied: $P"
+            ls -l "$P"
+            md5sum "$P"
           else
             echo "::warning::$P not found - building without it"
           fi
@@ -214,8 +216,13 @@ jobs:
           ZIP=".github/workflows/$(echo "$PORT" | tr 'A-Z' 'a-z')_patch.zip"
           if [ -f "$ZIP" ]; then
             unzip -o "$ZIP" -d .
-            rm -f "ports/$PORT/android/app/src/main/res/drawable/ic_launcher.xml"
+            # the old icon is replaced only when the zip brings a new one (Virtua Cop 3 keeps its own)
+            if [ -f "ports/$PORT/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml" ]; then
+              rm -f "ports/$PORT/android/app/src/main/res/drawable/ic_launcher.xml"
+            fi
             echo "HUD patch applied: $ZIP"
+            ls -l "$ZIP"
+            md5sum "$ZIP"
           else
             echo "::warning::$ZIP not found - building without HUD patch"
           fi
